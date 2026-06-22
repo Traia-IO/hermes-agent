@@ -1370,7 +1370,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            # Traia: skip ONLY user-representation memory on cron (the user-profile
+            # store + any external memory provider) — cron prompts aren't the user
+            # talking, so they'd corrupt those. The OPERATIONAL MEMORY.md is exactly
+            # what an autonomous cron agent needs to carry across ticks, so keep it
+            # whenever user-profile/provider are off (Traia trading agents set
+            # memory_enabled=True + user_profile_enabled=False + no provider). For a
+            # config that DOES enable a user profile/provider, this preserves the
+            # original skip (no behaviour change).
+            skip_memory=bool(
+                (_cfg.get("memory") or {}).get("user_profile_enabled", False)
+                or (_cfg.get("memory") or {}).get("provider")
+            ),
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,

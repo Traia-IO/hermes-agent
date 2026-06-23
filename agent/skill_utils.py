@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import datetime as _datetime
 import logging
 import os
 import re
@@ -85,11 +86,37 @@ def yaml_load(content: str):
 # ── Frontmatter parsing ──────────────────────────────────────────────────
 
 
+def _jsonsafe(obj: Any) -> Any:
+    """Recursively coerce YAML-native ``date``/``datetime``/``time`` scalars to
+    ISO strings so parsed frontmatter is always JSON-serializable.
+
+    YAML's safe loader turns bare date-like scalars (``created: 2026-01-15``,
+    ``updated: 2026-01-15 14:24:02``) into Python ``datetime`` objects. Those
+    flow through ``skill_view``'s ``result["metadata"]`` into ``json.dumps``,
+    which has no native datetime encoder and raises
+    ``"Object of type datetime is not JSON serializable"`` — breaking the tool
+    for *any* skill whose frontmatter carries a date. Stringifying here fixes it
+    for all current/future skills and harmonizes the YAML branch with the
+    fallback key:value branch below (which already yields strings).
+    """
+    if isinstance(obj, dict):
+        return {k: _jsonsafe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_jsonsafe(v) for v in obj]
+    # datetime is a subclass of date; date.isoformat() handles both, and time
+    # has its own isoformat().
+    if isinstance(obj, (_datetime.date, _datetime.time)):
+        return obj.isoformat()
+    return obj
+
+
 def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from a markdown string.
 
     Uses yaml with CSafeLoader for full YAML support (nested metadata, lists)
-    with a fallback to simple key:value splitting for robustness.
+    with a fallback to simple key:value splitting for robustness. Date-like
+    scalars are coerced to ISO strings (see ``_jsonsafe``) so the result is
+    always JSON-serializable.
 
     Returns:
         (frontmatter_dict, remaining_body)
@@ -110,7 +137,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     try:
         parsed = yaml_load(yaml_content)
         if isinstance(parsed, dict):
-            frontmatter = parsed
+            frontmatter = _jsonsafe(parsed)
     except Exception:
         # Fallback: simple key:value parsing for malformed YAML
         for line in yaml_content.strip().split("\n"):

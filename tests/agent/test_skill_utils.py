@@ -1,12 +1,56 @@
 """Tests for agent/skill_utils.py."""
 
+import json
+
 from unittest.mock import patch
 
 from agent.skill_utils import (
     extract_skill_conditions,
     iter_skill_index_files,
+    parse_frontmatter,
     skill_matches_platform,
 )
+
+
+def test_parse_frontmatter_date_scalar_is_json_safe_string():
+    """Regression: a bare date in frontmatter must not become a datetime object.
+
+    YAML's safe loader parses ``2026-01-15`` into a ``datetime.date``, which then
+    broke ``skill_view``'s ``json.dumps(result)`` with "Object of type datetime
+    is not JSON serializable". The parser now coerces it to an ISO string.
+    """
+    fm, _ = parse_frontmatter("---\nname: demo\ncreated: 2026-01-15\n---\nbody\n")
+    assert fm["created"] == "2026-01-15"
+    assert isinstance(fm["created"], str)
+    # The whole frontmatter must round-trip through json.dumps (no encoder hack).
+    json.dumps(fm)
+
+
+def test_parse_frontmatter_datetime_and_nested_dates_coerced():
+    """A datetime (with time) and dates nested under metadata are all ISO strings."""
+    content = (
+        "---\n"
+        "name: demo\n"
+        "updated: 2026-01-15 14:24:02\n"
+        "metadata:\n"
+        "  published: 2025-12-31\n"
+        "  tags: [a, b]\n"
+        "---\n"
+        "body\n"
+    )
+    fm, _ = parse_frontmatter(content)
+    assert fm["updated"] == "2026-01-15T14:24:02"
+    assert fm["metadata"]["published"] == "2025-12-31"
+    assert fm["metadata"]["tags"] == ["a", "b"]
+    json.dumps(fm)
+
+
+def test_parse_frontmatter_plain_strings_unchanged():
+    """Non-date scalars are untouched (no over-eager coercion)."""
+    fm, body = parse_frontmatter("---\nname: demo\nversion: 1.2.3\n---\nhello\n")
+    assert fm["name"] == "demo"
+    assert fm["version"] == "1.2.3"
+    assert body.strip() == "hello"
 
 
 def test_metadata_as_dict_with_hermes():

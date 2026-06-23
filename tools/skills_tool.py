@@ -1411,7 +1411,11 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        return json.dumps(result, ensure_ascii=False)
+        # default=str is a defensive net: parse_frontmatter already coerces
+        # date/datetime scalars to ISO strings, but any other stray
+        # non-JSON-serializable value (e.g. a Path) degrades to its str form
+        # instead of raising "Object of type ... is not JSON serializable".
+        return json.dumps(result, ensure_ascii=False, default=str)
 
     except Exception as e:
         return tool_error(str(e), success=False)

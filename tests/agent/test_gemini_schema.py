@@ -138,3 +138,45 @@ class TestSanitizeGeminiToolParameters:
         assert "1440" in aad["description"]
         # And the string-enum sibling is untouched.
         assert cleaned["properties"]["action"]["enum"] == ["create_thread"]
+
+
+class TestArrayItemsGuard:
+    """Gemini rejects a bare ``{"type": "array"}`` (no ``items``) with
+    ``...properties[args].items: missing field`` — which 400s every
+    tool-bearing call routed to Gemini. The sanitizer must inject a permissive
+    default ``items`` so any Hermes tool schema is Gemini-safe."""
+
+    def test_top_level_array_without_items_gets_default(self):
+        cleaned = sanitize_gemini_schema({"type": "array"})
+        assert cleaned["type"] == "array"
+        assert cleaned["items"] == {"type": "string"}
+
+    def test_array_property_without_items_gets_default(self):
+        # The exact shape that 400'd in CI: a param named ``args`` typed array
+        # with no items.
+        params = {
+            "type": "object",
+            "properties": {"args": {"type": "array", "description": "positional args"}},
+        }
+        cleaned = sanitize_gemini_tool_parameters(params)
+        args = cleaned["properties"]["args"]
+        assert args["type"] == "array"
+        assert args["items"] == {"type": "string"}
+        assert args["description"] == "positional args"
+
+    def test_existing_items_preserved(self):
+        cleaned = sanitize_gemini_schema(
+            {"type": "array", "items": {"type": "integer"}}
+        )
+        assert cleaned["items"] == {"type": "integer"}
+
+    def test_nested_array_without_items_gets_default(self):
+        # Array nested under items → still needs a default at the inner level.
+        cleaned = sanitize_gemini_schema(
+            {"type": "array", "items": {"type": "array"}}
+        )
+        assert cleaned["items"]["items"] == {"type": "string"}
+
+    def test_non_array_unaffected(self):
+        cleaned = sanitize_gemini_schema({"type": "string"})
+        assert "items" not in cleaned

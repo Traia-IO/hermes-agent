@@ -87,6 +87,18 @@ def sanitize_gemini_schema(schema: Any) -> Dict[str, Any]:
         if any(not isinstance(item, str) for item in enum_val):
             cleaned.pop("enum", None)
 
+    # Gemini's Schema validator REQUIRES every ``array`` type to declare an
+    # ``items`` schema; OpenAI / OpenRouter / Anthropic / xAI all tolerate a
+    # bare ``{"type": "array"}``. A tool whose array parameter omits ``items``
+    # makes Gemini reject the ENTIRE request with e.g.
+    # ``GenerateContentRequest...properties[args].items: missing field`` — which
+    # 400s every tool-bearing call routed to Gemini (observed in CI once a
+    # Gemini key was injected). Inject a permissive default so any Hermes tool
+    # schema is Gemini-safe. Runs on every (recursively sanitized) node, so it
+    # also covers nested arrays under ``properties`` / ``items`` / ``anyOf``.
+    if type_val == "array" and "items" not in cleaned:
+        cleaned["items"] = {"type": "string"}
+
     return cleaned
 
 

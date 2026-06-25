@@ -1064,6 +1064,21 @@ def handle_function_call(
             )
         except Exception:
             reset_current_observability_context = None
+        # Facet this thread's logs with the tool (+ skill, for skill_* tools)
+        # for the duration of dispatch, so every line the tool emits carries
+        # tool:[..]-skill:[..]. Cleared in the finally below. (No nesting here —
+        # the tool_search bridge recurses earlier and returns before this point,
+        # and _session_context is thread-local.)
+        try:
+            from hermes_logging import set_skill_context, set_tool_context
+
+            set_tool_context(function_name)
+            if function_name in ("skill_view", "skill_manage"):
+                _skill_name = function_args.get("name")
+                if isinstance(_skill_name, str) and _skill_name:
+                    set_skill_context(_skill_name)
+        except Exception:
+            pass
         try:
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
@@ -1089,6 +1104,13 @@ def handle_function_call(
                     reset_current_observability_context(_approval_tokens)
                 except Exception:
                     pass
+            try:
+                from hermes_logging import clear_skill_context, clear_tool_context
+
+                clear_tool_context()
+                clear_skill_context()
+            except Exception:
+                pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
         _emit_post_tool_call_hook(

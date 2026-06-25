@@ -47,8 +47,14 @@ _session_context = threading.local()
 # Default log format — includes timestamp, level, optional session tag,
 # logger name, and message.  The ``%(session_tag)s`` field is guaranteed to
 # exist on every LogRecord via _install_session_record_factory() below.
-_LOG_FORMAT = "%(asctime)s %(levelname)s%(session_tag)s %(name)s: %(message)s"
-_LOG_FORMAT_VERBOSE = "%(asctime)s - %(name)s - %(levelname)s%(session_tag)s - %(message)s"
+# ``%(facets)s`` is a structured, facetable prefix —
+# ``owner:[..]-name:[..]-run:[..]-tool:[..]-skill:[..]- `` — guaranteed on every
+# record by _install_session_record_factory() (empty string when there's no
+# agent context, so non-agent lines stay clean). It supersedes the old
+# ``session_tag`` (the run-id is now the ``run:`` facet); the factory still sets
+# ``session_tag`` for any back-compat reader.
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(facets)s%(name)s: %(message)s"
+_LOG_FORMAT_VERBOSE = "%(asctime)s - %(name)s - %(levelname)s %(facets)s%(message)s"
 
 # Third-party loggers that are noisy at DEBUG/INFO level.
 _NOISY_LOGGERS = (
@@ -88,6 +94,65 @@ def clear_session_context() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Structured log facets — so merged multi-agent logs stay discernible.
+#
+# Every record gets a ``facets`` prefix:
+#   owner:[<wallet/ws>]-name:[<agent>]-run:[<run-id>]-tool:[<tool>]-skill:[<skill>]-
+# ``owner`` + ``name`` are process-wide (each agent runs in its own process, set
+# once in setup_logging); ``run`` is the session id (per cron run); ``tool`` /
+# ``skill`` are thread-local, set around a tool/skill call. Empty when no context.
+# ---------------------------------------------------------------------------
+
+_agent_name: Optional[str] = None
+_owner_id: Optional[str] = None
+
+
+def set_agent_identity(
+    *, agent_name: Optional[str] = None, owner: Optional[str] = None
+) -> None:
+    """Set the process-wide agent name + owner for the log facet prefix. Each
+    agent runs in its own process, so these are constant for that process."""
+    global _agent_name, _owner_id
+    if agent_name is not None:
+        _agent_name = agent_name
+    if owner is not None:
+        _owner_id = owner
+
+
+def set_tool_context(tool_name: Optional[str]) -> None:
+    """Tag subsequent records on this thread with ``tool:[tool_name]``."""
+    _session_context.tool_name = tool_name
+
+
+def clear_tool_context() -> None:
+    _session_context.tool_name = None
+
+
+def set_skill_context(skill_name: Optional[str]) -> None:
+    """Tag subsequent records on this thread with ``skill:[skill_name]``."""
+    _session_context.skill_name = skill_name
+
+
+def clear_skill_context() -> None:
+    _session_context.skill_name = None
+
+
+def _build_facets() -> str:
+    """Compute the structured, facetable log prefix. Empty when there is no
+    agent/run/tool/skill context (keeps non-agent lines clean). Never raises."""
+    agent = _agent_name or ""
+    owner = _owner_id or ""
+    run = getattr(_session_context, "session_id", None) or ""
+    tool = getattr(_session_context, "tool_name", None) or ""
+    skill = getattr(_session_context, "skill_name", None) or ""
+    if not (agent or owner or run or tool or skill):
+        return ""
+    return (
+        f"owner:[{owner}]-name:[{agent}]-run:[{run}]-tool:[{tool}]-skill:[{skill}]- "
+    )
+
+
+# ---------------------------------------------------------------------------
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------
 
@@ -112,6 +177,12 @@ def _install_session_record_factory() -> None:
         record = current_factory(*args, **kwargs)
         sid = getattr(_session_context, "session_id", None)
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
+        # Structured facet prefix used by _LOG_FORMAT. Must never raise — a
+        # logging-time exception here would break every log call in the process.
+        try:
+            record.facets = _build_facets()  # type: ignore[attr-defined]
+        except Exception:
+            record.facets = ""  # type: ignore[attr-defined]
         return record
 
     _session_record_factory._hermes_session_injector = True  # type: ignore[attr-defined]
@@ -208,6 +279,15 @@ def setup_logging(
     """
     global _logging_initialized
     home = hermes_home or get_hermes_home()
+    # Structured-log identity (per-agent process): agent = profile dir name;
+    # owner = workspace owner wallet / id stamped into the pod env by the
+    # provisioner. Powers the facet prefix so merged multi-agent logs stay
+    # discernible. (Owner is wallet/ws-id, never raw email — PII-safe.)
+    set_agent_identity(
+        agent_name=home.name,
+        owner=os.environ.get("TRAIA_OWNER_WALLET")
+        or os.environ.get("TRAIA_WORKSPACE_ID"),
+    )
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 

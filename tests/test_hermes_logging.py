@@ -421,8 +421,12 @@ class TestSessionContext:
         assert "[abc123]" in content
         assert "tagged message" in content
 
-    def test_no_session_tag_without_context(self, hermes_home):
-        """Without session context, log lines have no session tag."""
+    def test_no_run_facet_without_session_context(self, hermes_home):
+        """Without session context, the ``run:`` facet is empty (no run id).
+
+        The process-wide ``name:`` facet (agent identity, set by setup_logging
+        from the home dir name) is still present — only the per-run id is gone.
+        """
         hermes_logging.setup_logging(hermes_home=hermes_home)
         hermes_logging.clear_session_context()
 
@@ -435,11 +439,11 @@ class TestSessionContext:
         agent_log = hermes_home / "logs" / "agent.log"
         content = agent_log.read_text()
         assert "untagged message" in content
-        # Should not have any [xxx] session tag
-        import re
         for line in content.splitlines():
             if "untagged message" in line:
-                assert not re.search(r"\[.+?\]", line.split("INFO")[1].split("test.no_session")[0])
+                # run facet present but empty; agent-name facet populated.
+                assert "run:[]" in line
+                assert "name:[hermes_test]" in line
 
     def test_clear_session_context(self, hermes_home):
         """After clearing, session tag disappears."""
@@ -538,6 +542,84 @@ class TestRecordFactory:
             logger.info("hello")
         finally:
             logger.removeHandler(handler)
+
+
+class TestLogFacets:
+    """The structured, facetable ``facets`` prefix on every LogRecord —
+    owner:[..]-name:[..]-run:[..]-tool:[..]-skill:[..]- so merged multi-agent
+    logs stay discernible."""
+
+    def _reset(self):
+        hermes_logging.set_agent_identity(agent_name="", owner="")
+        hermes_logging.clear_session_context()
+        hermes_logging.clear_tool_context()
+        hermes_logging.clear_skill_context()
+
+    def test_record_always_has_facets_attr(self):
+        """Every record carries a ``facets`` attr — empty without any context
+        (so gateway / non-agent lines stay clean)."""
+        self._reset()
+        try:
+            record = logging.getLogRecordFactory()(
+                "t", logging.INFO, "", 0, "m", (), None
+            )
+            assert hasattr(record, "facets")
+            assert record.facets == ""
+        finally:
+            self._reset()
+
+    def test_full_facet_prefix(self):
+        self._reset()
+        try:
+            hermes_logging.set_agent_identity(agent_name="bold-pilot", owner="0xWALLET")
+            hermes_logging.set_session_context("run-1")
+            hermes_logging.set_tool_context("swap")
+            hermes_logging.set_skill_context("technical-analysis")
+            record = logging.getLogRecordFactory()(
+                "t", logging.INFO, "", 0, "m", (), None
+            )
+            assert record.facets == (
+                "owner:[0xWALLET]-name:[bold-pilot]-run:[run-1]-"
+                "tool:[swap]-skill:[technical-analysis]- "
+            )
+        finally:
+            self._reset()
+
+    def test_tool_and_skill_cleared_independently(self):
+        """clear_tool_context / clear_skill_context empty just their facet,
+        leaving the process-wide agent identity intact."""
+        self._reset()
+        try:
+            hermes_logging.set_agent_identity(agent_name="a", owner="o")
+            hermes_logging.set_tool_context("swap")
+            hermes_logging.set_skill_context("ta")
+            hermes_logging.clear_tool_context()
+            hermes_logging.clear_skill_context()
+            record = logging.getLogRecordFactory()(
+                "t", logging.INFO, "", 0, "m", (), None
+            )
+            assert "tool:[]" in record.facets
+            assert "skill:[]" in record.facets
+            assert "name:[a]" in record.facets
+        finally:
+            self._reset()
+
+    def test_facets_render_in_log_format(self):
+        self._reset()
+        try:
+            hermes_logging.set_agent_identity(agent_name="bold-pilot", owner="0xW")
+            hermes_logging.set_session_context("run-9")
+            fmt = logging.Formatter(hermes_logging._LOG_FORMAT)
+            record = logging.getLogRecordFactory()(
+                "run_agent", logging.INFO, "", 0, "hi", (), None
+            )
+            line = fmt.format(record)
+            assert (
+                "owner:[0xW]-name:[bold-pilot]-run:[run-9]-tool:[]-skill:[]-" in line
+            )
+            assert line.endswith("run_agent: hi")
+        finally:
+            self._reset()
 
 
 class TestComponentFilter:

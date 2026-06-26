@@ -591,7 +591,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
-                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                # Re-stamp the tool facet (dispatch already cleared it) so this
+                # WARNING reaches GCP filterable by tool:[name].
+                try:
+                    from hermes_logging import clear_tool_context, set_tool_context
+
+                    set_tool_context(function_name)
+                except Exception:
+                    clear_tool_context = None
+                try:
+                    logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                finally:
+                    if clear_tool_context is not None:
+                        clear_tool_context()
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -1137,10 +1149,23 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
-        if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-        else:
-            logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        # Re-stamp the tool facet for this post-dispatch result log: the dispatch
+        # (model_tools.handle_function_call) already cleared its tool context by
+        # now, so without this the WARNING that reaches GCP would carry tool:[].
+        try:
+            from hermes_logging import clear_tool_context, set_tool_context
+
+            set_tool_context(function_name)
+        except Exception:
+            clear_tool_context = None
+        try:
+            if _is_error_result:
+                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            else:
+                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+        finally:
+            if clear_tool_context is not None:
+                clear_tool_context()
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed

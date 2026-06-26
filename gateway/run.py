@@ -19624,7 +19624,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
         _stderr_handler = logging.StreamHandler()
         _stderr_handler.setLevel(_stderr_level)
-        _stderr_handler.setFormatter(RedactingFormatter('%(levelname)s %(name)s: %(message)s'))
+        # Include the structured facet prefix (owner/name/run/tool/skill) so the
+        # agent log lines that reach pod stderr -> stdout -> GCP Cloud Logging are
+        # filterable/discernible across all agents (the gateway tees this stderr to
+        # the pod log stream). Mirrors the file handlers' _LOG_FORMAT. record.facets
+        # is guaranteed on every record by hermes_logging's record factory.
+        _stderr_handler.setFormatter(
+            RedactingFormatter('%(levelname)s %(facets)s%(name)s: %(message)s')
+        )
         logging.getLogger().addHandler(_stderr_handler)
         # Lower root logger level if needed so DEBUG records can reach the handler
         if _stderr_level < logging.getLogger().level:

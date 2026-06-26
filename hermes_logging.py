@@ -202,7 +202,13 @@ def setup_logging(
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
 
-    level_name = (log_level or cfg_level or "INFO").upper()
+    # TRAIA_AGENT_LOG_LEVEL pins the file (agent.log) level per deploy env — the
+    # control plane injects it into the tenant pod (DEBUG so the admin /logs Raw
+    # view shows the full stream). Precedence: explicit param > env > config >
+    # INFO. Sets the root level too, so the GCP-bound stderr handler can filter
+    # down to its own (possibly lower) level.
+    env_level = os.environ.get("TRAIA_AGENT_LOG_LEVEL")
+    level_name = (log_level or env_level or cfg_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
     backups = backup_count or cfg_backup or 3

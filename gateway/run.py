@@ -15173,10 +15173,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # verbosity=0    (default):    WARNING and above
     # verbosity=1    (-v):         INFO and above
     # verbosity=2+   (-vv/-vvv):   DEBUG
-    if verbosity is not None:
+    #
+    # This stderr stream is what the gateway tees to pod stdout -> GCP Cloud
+    # Logging. TRAIA_GCP_LOG_LEVEL (injected per deploy env by the control plane:
+    # DEBUG on develop, INFO on prod) pins its level independently of -v/-q, so
+    # the GCP-bound level is controlled by the environment, not the launch flags.
+    # When set it also forces the handler on (even if verbosity is None).
+    _env_gcp_level_name = (os.environ.get("TRAIA_GCP_LOG_LEVEL") or "").strip().upper()
+    _env_gcp_level = getattr(logging, _env_gcp_level_name, None) if _env_gcp_level_name else None
+    if verbosity is not None or _env_gcp_level is not None:
         from agent.redact import RedactingFormatter
 
-        _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
+        if _env_gcp_level is not None:
+            _stderr_level = _env_gcp_level
+        else:
+            _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
         _stderr_handler = logging.StreamHandler()
         _stderr_handler.setLevel(_stderr_level)
         _stderr_handler.setFormatter(RedactingFormatter('%(levelname)s %(name)s: %(message)s'))

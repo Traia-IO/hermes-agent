@@ -322,6 +322,25 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("XAI_API_KEY",),
         base_url_env_var="XAI_BASE_URL",
     ),
+    # First-class direct OpenAI provider (Traia fork). Upstream hermes has no
+    # bare "openai" registry entry — it only aliases "openai" → OpenRouter in
+    # providers.py (a map the RUNTIME resolver auth.resolve_provider does NOT
+    # use), so resolve_provider("openai") raised "Unknown provider 'openai'" and
+    # every gpt-5.x run died. Adding it here routes openai through the standard
+    # api_key path (runtime_provider._resolve_explicit_runtime), which honors
+    # OPENAI_BASE_URL — so it also works through the Traia LLM egress proxy
+    # exactly like anthropic/xai. api.openai.com auto-detects the Responses API
+    # for GPT-5.x; the explicit codex_responses default in runtime_provider keeps
+    # that correct when base_url points at the proxy. See traia-agent-workspaces
+    # docs/specs/llm-egress-proxy.md.
+    "openai": ProviderConfig(
+        id="openai",
+        name="OpenAI",
+        auth_type="api_key",
+        inference_base_url="https://api.openai.com/v1",
+        api_key_env_vars=("OPENAI_API_KEY",),
+        base_url_env_var="OPENAI_BASE_URL",
+    ),
     "nvidia": ProviderConfig(
         id="nvidia",
         name="NVIDIA NIM",

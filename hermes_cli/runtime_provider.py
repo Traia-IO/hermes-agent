@@ -1228,6 +1228,11 @@ def _resolve_explicit_runtime(
             api_mode = _copilot_runtime_api_mode(model_cfg, api_key)
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "openai":
+            # GPT-5.x requires the Responses API (see the fallback resolver + the
+            # explicit-provider comment). Default explicitly so it's correct when
+            # base_url is the Traia LLM proxy, not a literal api.openai.com host.
+            api_mode = _parse_api_mode(model_cfg.get("api_mode")) or "codex_responses"
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
             if configured_mode:
@@ -1668,6 +1673,12 @@ def resolve_runtime_provider(
             api_mode = _copilot_runtime_api_mode(model_cfg, creds.get("api_key", ""))
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider == "openai":
+            # GPT-5.x requires the Responses API. Default to it explicitly so it
+            # stays correct when base_url points at the Traia LLM proxy (URL
+            # auto-detect only fires for a literal api.openai.com host). A
+            # config.yaml api_mode still wins for a rare chat_completions model.
+            api_mode = _parse_api_mode(model_cfg.get("api_mode")) or "codex_responses"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.

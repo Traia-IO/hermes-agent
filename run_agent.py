@@ -1371,8 +1371,22 @@ class AIAgent:
                 # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
                 # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
                 # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
-                _is_native_anthropic = self.provider == "anthropic"
-                effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
+                #
+                # A base_url ending in "/anthropic" is our LLM egress proxy (or a
+                # third-party Anthropic-compatible endpoint), NOT native
+                # api.anthropic.com. There the provider key is what's passed/stamped
+                # (api_key, else the ANTHROPIC_API_KEY env — at our proxy that env IS
+                # the workspace callback token). It must NOT come from the Claude-Code
+                # OAuth/creds chain (resolve_anthropic_token), which would shadow the
+                # stamped token with a stale sk-ant/cc value and 401 at the proxy
+                # (Traia egress-proxy gateway_callback_auth_failed, 2026-07-07). This
+                # mirrors openai/xai, which use the env key directly.
+                _is_proxied_anthropic = self._base_url_lower.rstrip("/").endswith("/anthropic")
+                _is_native_anthropic = self.provider == "anthropic" and not _is_proxied_anthropic
+                if _is_proxied_anthropic:
+                    effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
+                else:
+                    effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = base_url
@@ -2404,8 +2418,17 @@ class AIAgent:
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
             # API key — falling back would send Anthropic credentials to third-party endpoints.
-            _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
+            # A "/anthropic"-suffixed base_url is our egress proxy / a third-party
+            # endpoint (not native api.anthropic.com): use the stamped ANTHROPIC_API_KEY
+            # (the workspace callback token at our proxy), never the OAuth/creds chain
+            # or a stale self.api_key — see the init path above (2026-07-07 401 fix).
+            _switch_base_url = str(base_url or getattr(self, "_anthropic_base_url", "") or "").lower()
+            _is_proxied_anthropic = _switch_base_url.rstrip("/").endswith("/anthropic")
+            _is_native_anthropic = new_provider == "anthropic" and not _is_proxied_anthropic
+            if _is_proxied_anthropic:
+                effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
+            else:
+                effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
             self.api_key = effective_key
             self._anthropic_api_key = effective_key
             self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
@@ -7932,7 +7955,14 @@ class AIAgent:
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-                effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
+                # "/anthropic"-suffixed fb_base_url = egress proxy / third-party (not
+                # native): use the stamped ANTHROPIC_API_KEY (callback token at our
+                # proxy), not the OAuth/creds chain (2026-07-07 401 fix).
+                _fb_proxied_anthropic = fb_base_url.rstrip("/").lower().endswith("/anthropic")
+                if _fb_proxied_anthropic:
+                    effective_key = fb_client.api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
+                else:
+                    effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = fb_base_url

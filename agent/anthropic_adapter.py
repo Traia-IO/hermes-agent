@@ -511,6 +511,33 @@ def _common_betas_for_base_url(
     return betas
 
 
+def _egress_proxy_callback_token(base_url=None) -> Optional[str]:
+    """Auth override for Traia's LLM egress proxy.
+
+    When an Anthropic request is routed through our egress proxy, the ONLY valid
+    auth is the per-workspace callback token stamped into ``ANTHROPIC_API_KEY``
+    (format ``<uid>.<random>``) — the proxy validates it and swaps in the real
+    upstream key. ``resolve_anthropic_token()`` otherwise returns a Claude Code
+    OAuth token (``sk-ant-oat01…``, priority 1-3) AHEAD of ``ANTHROPIC_API_KEY``
+    (priority 4), and the proxy rejects that as a malformed callback token → 401.
+    That is why Anthropic never worked through the proxy while openai/xai did:
+    only the Anthropic leg runs the OAuth priority chain. Same rationale as the
+    Azure-endpoint bypass in ``runtime_provider.resolve_runtime_provider``.
+
+    The proxy is detected from the *effective* endpoint the SDK will actually
+    use: the explicit ``base_url`` when given, else the ``ANTHROPIC_BASE_URL`` env
+    var the SDK reads on its own. Returns the callback token when proxied (and
+    present), else ``None`` (leaving the normal resolution untouched — BYOK /
+    native / third-party paths never match ``platform-proxy-llm``).
+    """
+    effective = (str(base_url).strip() if base_url else "") or os.getenv(
+        "ANTHROPIC_BASE_URL", ""
+    )
+    if "platform-proxy-llm" in effective.lower():
+        return os.getenv("ANTHROPIC_API_KEY", "").strip() or None
+    return None
+
+
 def build_anthropic_client(
     api_key: str,
     base_url: str = None,
@@ -540,6 +567,16 @@ def build_anthropic_client(
             "The 'anthropic' package is required for the Anthropic provider. "
             "Install it with: pip install 'anthropic>=0.39.0'"
         )
+
+    # Traia LLM egress proxy: force the per-workspace callback token so EVERY
+    # construction path (initial resolve, credential-pool rotation, fallback)
+    # sends it. Our proxy URL classifies as a third-party endpoint below, so the
+    # token rides x-api-key exactly as the proxy's Anthropic leg expects. This is
+    # the universal choke point — all Anthropic clients are built here — so it
+    # also covers callers (e.g. _swap_credential) that bypass resolve_anthropic_token.
+    _proxy_callback_token = _egress_proxy_callback_token(base_url)
+    if _proxy_callback_token:
+        api_key = _proxy_callback_token
 
     normalize_proxy_env_vars()
 
@@ -954,6 +991,14 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
+    # 0. Traia LLM egress proxy: when routed through our proxy (ANTHROPIC_BASE_URL),
+    # the callback token in ANTHROPIC_API_KEY is the ONLY valid auth. Bypass the
+    # OAuth priority chain below, which would otherwise return a Claude Code OAuth
+    # token the proxy rejects as malformed → 401. See _egress_proxy_callback_token.
+    proxy_callback_token = _egress_proxy_callback_token()
+    if proxy_callback_token:
+        return proxy_callback_token
+
     creds = read_claude_code_credentials()
 
     # 1. Hermes-managed OAuth/setup token env var

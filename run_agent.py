@@ -1382,8 +1382,18 @@ class AIAgent:
                 # (Traia egress-proxy gateway_callback_auth_failed, 2026-07-07). This
                 # mirrors openai/xai, which use the env key directly.
                 _is_proxied_anthropic = self._base_url_lower.rstrip("/").endswith("/anthropic")
+                _is_our_egress_proxy = "platform-proxy-llm" in self._base_url_lower
                 _is_native_anthropic = self.provider == "anthropic" and not _is_proxied_anthropic
-                if _is_proxied_anthropic:
+                if _is_our_egress_proxy:
+                    # OUR egress proxy: the stamped ANTHROPIC_API_KEY IS the per-workspace
+                    # callback token and MUST WIN — a passed api_key can be a stale
+                    # OAuth/creds value (the caller's own resolution) that the proxy 401s.
+                    # Confirmed 2026-07-07: a non-empty stale api_key shadowed the callback
+                    # token → gateway_callback_auth_failed. openai/xai use the env key too.
+                    effective_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or api_key or ""
+                elif _is_proxied_anthropic:
+                    # Third-party Anthropic-compatible endpoint (MiniMax etc.): the passed
+                    # key is the correct one; never the Claude-Code OAuth chain.
                     effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
                 else:
                     effective_key = (api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or "")
@@ -2424,8 +2434,13 @@ class AIAgent:
             # or a stale self.api_key — see the init path above (2026-07-07 401 fix).
             _switch_base_url = str(base_url or getattr(self, "_anthropic_base_url", "") or "").lower()
             _is_proxied_anthropic = _switch_base_url.rstrip("/").endswith("/anthropic")
+            _is_our_egress_proxy = "platform-proxy-llm" in _switch_base_url
             _is_native_anthropic = new_provider == "anthropic" and not _is_proxied_anthropic
-            if _is_proxied_anthropic:
+            if _is_our_egress_proxy:
+                # OUR egress proxy: stamped ANTHROPIC_API_KEY (callback token) wins over
+                # any passed/stale api_key (2026-07-07 401 fix — see init path).
+                effective_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or api_key or ""
+            elif _is_proxied_anthropic:
                 effective_key = api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
             else:
                 effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
@@ -7959,7 +7974,10 @@ class AIAgent:
                 # native): use the stamped ANTHROPIC_API_KEY (callback token at our
                 # proxy), not the OAuth/creds chain (2026-07-07 401 fix).
                 _fb_proxied_anthropic = fb_base_url.rstrip("/").lower().endswith("/anthropic")
-                if _fb_proxied_anthropic:
+                _fb_our_egress_proxy = "platform-proxy-llm" in fb_base_url.lower()
+                if _fb_our_egress_proxy:
+                    effective_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or fb_client.api_key or ""
+                elif _fb_proxied_anthropic:
                     effective_key = fb_client.api_key or os.getenv("ANTHROPIC_API_KEY", "").strip() or ""
                 else:
                     effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")

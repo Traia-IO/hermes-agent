@@ -180,6 +180,15 @@ class PooledCredential:
             return
         live = _env_value_prefer_dotenv(env_var)
         if live and live != (self.access_token or ""):
+            # Rewrite the cached token to the LIVE env value. The run path reads
+            # ``access_token`` DIRECTLY (not only ``runtime_api_key``), so the field
+            # itself must be fresh — verified in-pod that a stale ``access_token``
+            # is what reaches the wire. This also scrubs a stale real key off disk
+            # on the next persist (closing the leak). Uses the SAME resolver as
+            # ``_seed_from_env`` (prefer-dotenv), so a freshly-seeded entry is a
+            # no-op here (its ``access_token`` already equals ``live``). Also clear
+            # stale exhausted/error state so the entry is retried immediately.
+            self.access_token = live
             self.last_status = None
             self.last_status_at = None
             self.last_error_code = None

@@ -38,18 +38,18 @@ def _stale_entry_payload():
     }
 
 
-def test_from_dict_serves_live_env_and_clears_exhausted():
+def test_from_dict_refreshes_access_token_and_clears_exhausted():
     os.environ["ANTHROPIC_API_KEY"] = CALLBACK
     try:
         m = _mod()
         c = m.PooledCredential.from_dict("anthropic", _stale_entry_payload())
-        # The WIRE credential (what actually gets sent) must be the live callback
-        # token, not the stale cached real key.
+        # BOTH the field the run path reads directly AND the property must be the
+        # live callback token — a stale access_token is what reached the wire in prod.
+        assert c.access_token == CALLBACK, f"stale cached key must be refreshed, got {c.access_token!r}"
         assert c.runtime_api_key == CALLBACK, f"must serve the callback token, got {c.runtime_api_key!r}"
-        # Stale exhausted/error state is cleared so the entry is selectable again.
+        # Stale exhausted/error state cleared so the entry is selectable again.
         assert c.last_status is None, "stale exhausted status must be cleared when env changed"
         assert c.last_error_code is None
-        # We intentionally do NOT rewrite access_token on load (seeding owns it).
     finally:
         os.environ.pop("ANTHROPIC_API_KEY", None)
 

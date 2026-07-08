@@ -89,6 +89,21 @@ _EXTRA_KEYS = frozenset({
 })
 
 
+def _env_value_prefer_dotenv(key: str) -> str:
+    """Resolve a credential env var the way the pool SEEDS them (see
+    ``_seed_from_env`` / regression #18254): ``~/.hermes/.env`` wins over a
+    possibly-stale ``os.environ``. Returns ``""`` when neither has it. Used by the
+    env-cache-invalidation in ``PooledCredential`` so refresh reads the SAME source
+    seeding does."""
+    if not key:
+        return ""
+    try:
+        env_file = load_env()
+    except Exception:
+        env_file = {}
+    return (env_file.get(key) or os.environ.get(key) or "").strip()
+
+
 @dataclass
 class PooledCredential:
     provider: str
@@ -136,7 +151,41 @@ class PooledCredential:
         data.setdefault("priority", 0)
         data.setdefault("source", SOURCE_MANUAL)
         data.setdefault("access_token", "")
-        return cls(provider=provider, **data)
+        cred = cls(provider=provider, **data)
+        cred._sync_env_source()
+        return cred
+
+    def _sync_env_source(self) -> None:
+        """An ``env:<VAR>``-sourced credential must FOLLOW its env var. When the
+        live env value differs from the persisted ``access_token`` — e.g. the
+        LLM-egress-proxy cutover replaced a real provider key with the per-workspace
+        callback token — CLEAR any stale exhausted/error state so the entry is
+        retried immediately (otherwise a pre-cutover 401 keeps it 'exhausted').
+
+        The live value itself is resolved at SERVE time (``runtime_api_key``); we
+        deliberately do NOT rewrite ``access_token`` here — seeding
+        (``_seed_from_env``) already set it with provider-specific precedence, and
+        re-resolving on load would double-resolve and fight that (see the
+        ``prefer_dotenv`` vs ``os_environ_still_wins`` seeding tests). Real fix for
+        the 2026-07-08 anthropic-proxy 401: pre-cutover agents cached the real
+        ``sk-ant-api`` key; after cutover the env holds the callback token, and this
+        (+ the serve-time re-read) makes the pool follow the env instead of the
+        stale cache — healing every migrated agent with no per-agent data surgery.
+        Empty env ⇒ no-op."""
+        src = self.source or ""
+        if not src.startswith("env:"):
+            return
+        env_var = src[len("env:") :].strip()
+        if not env_var:
+            return
+        live = _env_value_prefer_dotenv(env_var)
+        if live and live != (self.access_token or ""):
+            self.last_status = None
+            self.last_status_at = None
+            self.last_error_code = None
+            self.last_error_reason = None
+            self.last_error_message = None
+            self.last_error_reset_at = None
 
     def to_dict(self) -> Dict[str, Any]:
         _ALWAYS_EMIT = {
@@ -161,6 +210,16 @@ class PooledCredential:
 
     @property
     def runtime_api_key(self) -> str:
+        # env:-sourced credentials track the live env var (see _sync_env_source);
+        # re-read at serve time too so a stale cached token can never reach the wire
+        # even if the load-time sync was skipped. Empty env ⇒ fall back to cache.
+        src = self.source or ""
+        if src.startswith("env:"):
+            env_var = src[len("env:") :].strip()
+            if env_var:
+                live = _env_value_prefer_dotenv(env_var)
+                if isinstance(live, str) and live.strip():
+                    return live.strip()
         if self.provider == "nous":
             return str(self.agent_key or self.access_token or "")
         return str(self.access_token or "")

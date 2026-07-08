@@ -515,26 +515,37 @@ def _egress_proxy_callback_token(base_url=None) -> Optional[str]:
     """Auth override for Traia's LLM egress proxy.
 
     When an Anthropic request is routed through our egress proxy, the ONLY valid
-    auth is the per-workspace callback token stamped into ``ANTHROPIC_API_KEY``
-    (format ``<uid>.<random>``) — the proxy validates it and swaps in the real
-    upstream key. ``resolve_anthropic_token()`` otherwise returns a Claude Code
-    OAuth token (``sk-ant-oat01…``, priority 1-3) AHEAD of ``ANTHROPIC_API_KEY``
-    (priority 4), and the proxy rejects that as a malformed callback token → 401.
-    That is why Anthropic never worked through the proxy while openai/xai did:
-    only the Anthropic leg runs the OAuth priority chain. Same rationale as the
-    Azure-endpoint bypass in ``runtime_provider.resolve_runtime_provider``.
+    auth is the per-workspace **callback token** (format ``<uid>.<random>``) — the
+    proxy validates it and swaps in the real upstream key server-side. Otherwise
+    ``resolve_anthropic_token()`` sends whatever it resolves (an OAuth token, or —
+    as seen in prod 2026-07-08 — a **real ``sk-ant-api`` key still stamped into the
+    ``ANTHROPIC_API_KEY`` slot** on some renders), which the proxy rejects as a
+    malformed callback token → 401. This is why Anthropic 401'd through the proxy
+    while openai/xai (which read their env key directly) did not.
 
-    The proxy is detected from the *effective* endpoint the SDK will actually
-    use: the explicit ``base_url`` when given, else the ``ANTHROPIC_BASE_URL`` env
-    var the SDK reads on its own. Returns the callback token when proxied (and
-    present), else ``None`` (leaving the normal resolution untouched — BYOK /
-    native / third-party paths never match ``platform-proxy-llm``).
+    Read the callback token from the CANONICAL ``TRAIA_GATEWAY_CALLBACK_TOKEN`` env
+    — the sandbox template always sets it to the callback token, independent of the
+    ``*_API_KEY`` mapping — so we never forward a real key that leaked into
+    ``ANTHROPIC_API_KEY``. (``ANTHROPIC_API_KEY`` is used only as a last-resort
+    fallback, and only when it already *looks* like a callback token.)
+
+    The proxy is detected from BOTH the explicit ``base_url`` AND the
+    ``ANTHROPIC_BASE_URL`` env the SDK reads on its own (never short-circuit the
+    env check on a non-proxy ``base_url``). Returns ``None`` when not proxied,
+    leaving normal resolution untouched (BYOK / native / third-party).
     """
-    effective = (str(base_url).strip() if base_url else "") or os.getenv(
-        "ANTHROPIC_BASE_URL", ""
-    )
-    if "platform-proxy-llm" in effective.lower():
-        return os.getenv("ANTHROPIC_API_KEY", "").strip() or None
+    signal = f"{str(base_url or '').strip().lower()} {os.getenv('ANTHROPIC_BASE_URL', '').lower()}"
+    if "platform-proxy-llm" not in signal:
+        return None
+    callback = os.getenv("TRAIA_GATEWAY_CALLBACK_TOKEN", "").strip()
+    if callback:
+        return callback
+    # Last-resort fallback: only if ANTHROPIC_API_KEY already holds a
+    # callback-shaped token (has a "." and is NOT a real ``sk-ant`` key), never a
+    # real provider key.
+    fallback = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if fallback and "." in fallback and not fallback.startswith("sk-ant"):
+        return fallback
     return None
 
 

@@ -1,15 +1,17 @@
-"""PROVES the 2026-07-07 anthropic-proxy 401 fix.
+"""PROVES the anthropic-proxy 401 fix (v4).
 
-Incident: platform-tier Sonnet agents 401'd (`gateway_callback_auth_failed`,
-`malformed_token`) on every run through the LLM egress proxy, while openai/xai
-worked. Root cause: `resolve_anthropic_token()` returns a Claude Code OAuth token
-(`sk-ant-oat01…`, priority 1-3) AHEAD of `ANTHROPIC_API_KEY` (priority 4 = the
-per-workspace callback token the proxy validates). The OAuth token rode x-api-key
-(our proxy URL classifies as a third-party endpoint) but its VALUE is not a valid
-`<uid>.<random>` callback token → proxy 401.
+Incident (prod 2026-07-08): platform-tier Sonnet agents 401'd through the LLM
+egress proxy while openai/xai (SAME workspace, SAME callback token) succeeded.
+The token-shape diagnostic showed the anthropic leg was sending a REAL
+``sk-ant-api`` key (108 chars, 0 dots) — i.e. ``ANTHROPIC_API_KEY`` in the pod
+still carried a real provider key, while ``OPENAI_API_KEY``/``XAI_API_KEY`` held
+the per-workspace callback token. The proxy correctly rejected the real key as a
+malformed callback token.
 
-Fix: when routed through our egress proxy, force the callback token in
-ANTHROPIC_API_KEY at both the resolver and the build choke point.
+v4 fix: when routed through our egress proxy, send the CANONICAL callback token
+from ``TRAIA_GATEWAY_CALLBACK_TOKEN`` (always set to the callback token by the
+sandbox template, independent of the ``*_API_KEY`` mapping) — never a real key
+that leaked into ``ANTHROPIC_API_KEY``.
 """
 
 import os
@@ -20,7 +22,8 @@ PROXY = (
     "/v1/runtime-callback/workspaces/me/platform-proxy-llm/anthropic"
 )
 CALLBACK = "b27ab1249ea4.d4c3b2a1deadbeefcafef00d"  # <uid>.<random>
-STALE_OAUTH = "sk-ant-oat01-STALE-CLAUDE-CODE-TOKEN-shadowing-the-callback"
+REAL_KEY = "sk-ant-api03-" + ("A" * 95)  # a real Console API key polluting the slot
+STALE_OAUTH = "sk-ant-oat01-STALE-CLAUDE-CODE-TOKEN"
 
 
 def _adapter():
@@ -28,68 +31,77 @@ def _adapter():
     return importlib.reload(a)
 
 
-def _clear(monkeypatch=None):
+def _clear():
     for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
-              "CLAUDE_CODE_OAUTH_TOKEN"):
+              "CLAUDE_CODE_OAUTH_TOKEN", "TRAIA_GATEWAY_CALLBACK_TOKEN"):
         os.environ.pop(k, None)
 
 
-def test_resolve_prefers_callback_token_over_oauth_when_proxied():
+def test_proxied_uses_canonical_callback_over_polluted_api_key_and_oauth():
+    # THE prod scenario: proxied, ANTHROPIC_API_KEY carries a REAL sk-ant-api key,
+    # a stale OAuth token is around, and the canonical callback env is set.
     _clear()
     os.environ["ANTHROPIC_BASE_URL"] = PROXY
-    os.environ["ANTHROPIC_API_KEY"] = CALLBACK
-    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = STALE_OAUTH  # priority-2 shadow
+    os.environ["ANTHROPIC_API_KEY"] = REAL_KEY            # the leaked real key (bug)
+    os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = STALE_OAUTH   # priority-2 shadow
+    os.environ["TRAIA_GATEWAY_CALLBACK_TOKEN"] = CALLBACK  # canonical callback token
     a = _adapter()
-    tok = a.resolve_anthropic_token()
-    assert tok == CALLBACK, f"proxied resolve must return callback token, got {tok!r}"
+    assert a.resolve_anthropic_token() == CALLBACK, "must send the callback token, not the real key/OAuth"
 
 
-def test_proxy_bypass_is_gated_and_hermetic():
-    # The bypass helper must fire ONLY when proxied, and only when the callback
-    # token is present. (Hermetic: exercises the exact gate we added, without
-    # depending on the machine's real ~/.claude credentials.)
-    _clear()
-    a = _adapter()
-    os.environ["ANTHROPIC_API_KEY"] = CALLBACK
-    assert a._egress_proxy_callback_token() is None, "no proxy env → no bypass"
-    os.environ["ANTHROPIC_BASE_URL"] = PROXY
-    assert a._egress_proxy_callback_token() == CALLBACK, "proxied → bypass returns callback token"
-    os.environ.pop("ANTHROPIC_API_KEY")
-    assert a._egress_proxy_callback_token() is None, "proxied but no key → fall through, no crash"
-
-
-def test_build_client_sends_callback_token_in_x_api_key_when_proxied():
+def test_build_client_sends_callback_in_x_api_key_not_the_real_key():
     _clear()
     os.environ["ANTHROPIC_BASE_URL"] = PROXY
-    os.environ["ANTHROPIC_API_KEY"] = CALLBACK
+    os.environ["ANTHROPIC_API_KEY"] = REAL_KEY
+    os.environ["TRAIA_GATEWAY_CALLBACK_TOKEN"] = CALLBACK
     a = _adapter()
-    # Simulate the bug input: the OAuth token was resolved and passed in.
-    client = a.build_anthropic_client(STALE_OAUTH, PROXY)
-    # The wire credential must be the callback token, on x-api-key (not Bearer).
-    assert client.api_key == CALLBACK, f"x-api-key must be callback token, got {client.api_key!r}"
+    # Even if a real key is passed in (as resolve would have), the proxied build
+    # must overwrite it with the callback token on x-api-key.
+    client = a.build_anthropic_client(REAL_KEY, PROXY)
+    assert client.api_key == CALLBACK, f"x-api-key must be the callback token, got {client.api_key!r}"
     assert not getattr(client, "auth_token", None), "must NOT use Authorization: Bearer"
     hdrs = {k.lower(): v for k, v in client.auth_headers.items()}
-    assert hdrs.get("x-api-key") == CALLBACK, f"auth_headers x-api-key wrong: {client.auth_headers}"
-    assert "authorization" not in hdrs, f"unexpected bearer: {client.auth_headers}"
+    assert hdrs.get("x-api-key") == CALLBACK, f"auth_headers wrong: {client.auth_headers}"
+
+
+def test_detection_uses_env_even_when_base_url_is_nonproxy():
+    # base_url param non-proxy but ANTHROPIC_BASE_URL=proxy → must still detect
+    # (the old code short-circuited on a truthy non-proxy base_url).
+    _clear()
+    os.environ["ANTHROPIC_BASE_URL"] = PROXY
+    os.environ["TRAIA_GATEWAY_CALLBACK_TOKEN"] = CALLBACK
+    a = _adapter()
+    assert a._egress_proxy_callback_token("https://api.anthropic.com") == CALLBACK
+
+
+def test_gated_off_when_not_proxied():
+    _clear()
+    os.environ["ANTHROPIC_API_KEY"] = REAL_KEY
+    os.environ["TRAIA_GATEWAY_CALLBACK_TOKEN"] = CALLBACK
+    a = _adapter()
+    assert a._egress_proxy_callback_token() is None, "no proxy env → no override"
+    assert a._egress_proxy_callback_token("https://api.anthropic.com") is None
 
 
 def test_build_client_leaves_byok_untouched():
-    _clear()  # no proxy env at all
+    _clear()  # no proxy env
     a = _adapter()
     client = a.build_anthropic_client("sk-ant-api03-byok", "https://api.anthropic.com")
     assert client.api_key == "sk-ant-api03-byok", "BYOK/native path must be untouched"
 
 
-def test_build_client_native_base_url_in_proxied_pod_not_overridden():
-    # In a proxied pod ANTHROPIC_BASE_URL=proxy, but a client explicitly built
-    # against native anthropic (base_url param wins) must NOT get the callback
-    # token (it would 401 against real anthropic). Precision guard.
+def test_fallback_never_forwards_a_real_key():
+    # Proxied, canonical env MISSING, ANTHROPIC_API_KEY holds a REAL key →
+    # must NOT fall back to it (would 401); returns None so it isn't sent.
     _clear()
     os.environ["ANTHROPIC_BASE_URL"] = PROXY
+    os.environ["ANTHROPIC_API_KEY"] = REAL_KEY
+    a = _adapter()
+    assert a._egress_proxy_callback_token() is None, "must never forward a real sk-ant key"
+    # But a callback-shaped ANTHROPIC_API_KEY (legacy correct render) is accepted.
     os.environ["ANTHROPIC_API_KEY"] = CALLBACK
     a = _adapter()
-    client = a.build_anthropic_client("sk-ant-api03-byok", "https://api.anthropic.com")
-    assert client.api_key == "sk-ant-api03-byok", "explicit native base_url must not be overridden"
+    assert a._egress_proxy_callback_token() == CALLBACK
 
 
 if __name__ == "__main__":

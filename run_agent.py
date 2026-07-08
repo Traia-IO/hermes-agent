@@ -5809,6 +5809,38 @@ class AIAgent:
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
+        # LLM egress proxy (Traia): an openai/xai client routed through OUR proxy
+        # (…/platform-proxy-llm/<provider>/v1) MUST authenticate with the
+        # per-workspace CALLBACK TOKEN, not a real/stale pooled key. The
+        # OpenAI-client path forwards the passed api_key (self.api_key / config /
+        # credential pool), which for a platform agent can be a raw `xai-…`/`sk-…`
+        # key → the proxy rejects it (callback_auth.malformed_token → 401
+        # gateway_callback_auth_failed; confirmed 2026-07-08 on prod — a fresh
+        # platform grok agent sent token_shape class=opaque len=84 dots=0
+        # head=xai-…). Reuse the anthropic adapter's canonical resolver: it reads
+        # TRAIA_GATEWAY_CALLBACK_TOKEN (the sandbox template always sets it,
+        # independent of the *_API_KEY mapping) and NEVER forwards a raw key. This
+        # is the openai/xai analogue of the 2026-07-07/08 anthropic egress-proxy
+        # fix (whose comments wrongly assumed "openai/xai read the env key
+        # directly" — the client path takes the passed key, so the callback token
+        # must be re-asserted at this single build choke point, covering init /
+        # switch_model / fallback). Gate on THIS client's base_url so a native
+        # openai/xai call is never clobbered. No-op off our proxy. openrouter is
+        # BYOK and never proxied.
+        _bu_proxy = str(client_kwargs.get("base_url", "") or "").lower()
+        if "platform-proxy-llm" in _bu_proxy:
+            try:
+                from agent.anthropic_adapter import _egress_proxy_callback_token
+                _proxy_cb = _egress_proxy_callback_token(client_kwargs.get("base_url"))
+            except Exception:
+                _proxy_cb = None
+            if _proxy_cb and _proxy_cb != client_kwargs.get("api_key"):
+                logger.info(
+                    "egress_proxy.key_override reason=%s %s",
+                    reason,
+                    self._client_log_context(),
+                )
+                client_kwargs["api_key"] = _proxy_cb
         if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
             from agent.copilot_acp_client import CopilotACPClient
 

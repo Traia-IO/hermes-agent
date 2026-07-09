@@ -21,7 +21,8 @@ PROXY = (
     "http://llm-egress-proxy.traia-system.svc.cluster.local"
     "/v1/runtime-callback/workspaces/me/platform-proxy-llm/anthropic"
 )
-CALLBACK = "b27ab1249ea4.d4c3b2a1deadbeefcafef00d"  # <uid>.<random>
+CALLBACK = "b27ab1249ea4.d4c3b2a1deadbeefcafef00d"  # <uid>.<random> (workspace)
+AGENT_CALLBACK = "b27ab1249ea4.alpha-keeper.deadbeefcafef00dsig"  # <uid>.<agent>.<sig>
 REAL_KEY = "sk-ant-api03-" + ("A" * 95)  # a real Console API key polluting the slot
 STALE_OAUTH = "sk-ant-oat01-STALE-CLAUDE-CODE-TOKEN"
 
@@ -33,8 +34,33 @@ def _adapter():
 
 def _clear():
     for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
-              "CLAUDE_CODE_OAUTH_TOKEN", "TRAIA_GATEWAY_CALLBACK_TOKEN"):
+              "CLAUDE_CODE_OAUTH_TOKEN", "TRAIA_GATEWAY_CALLBACK_TOKEN",
+              "TRAIA_AGENT_CALLBACK_TOKEN"):
         os.environ.pop(k, None)
+
+
+def test_worker_uses_per_agent_token_when_gateway_token_scrubbed():
+    # v8 — THE proven prod scenario (alpha-keeper, 2026-07-09): in the agent-child
+    # WORKER, TRAIA_GATEWAY_CALLBACK_TOKEN is scrubbed, the per-agent token is
+    # present, and ANTHROPIC_API_KEY carries the pool's cached REAL sk-ant key.
+    # Must send the PER-AGENT callback token, never the real key.
+    _clear()
+    os.environ["ANTHROPIC_BASE_URL"] = PROXY
+    os.environ["ANTHROPIC_API_KEY"] = REAL_KEY                 # pool-injected real key
+    os.environ["TRAIA_AGENT_CALLBACK_TOKEN"] = AGENT_CALLBACK  # per-agent token (workspace token scrubbed)
+    a = _adapter()
+    assert a._egress_proxy_callback_token() == AGENT_CALLBACK
+    assert a.resolve_anthropic_token() == AGENT_CALLBACK, "worker must send the per-agent callback token, not the real key"
+
+
+def test_gateway_token_takes_precedence_over_per_agent_token():
+    # In the gateway/parent (both set), prefer the canonical workspace token.
+    _clear()
+    os.environ["ANTHROPIC_BASE_URL"] = PROXY
+    os.environ["TRAIA_GATEWAY_CALLBACK_TOKEN"] = CALLBACK
+    os.environ["TRAIA_AGENT_CALLBACK_TOKEN"] = AGENT_CALLBACK
+    a = _adapter()
+    assert a._egress_proxy_callback_token() == CALLBACK
 
 
 def test_proxied_uses_canonical_callback_over_polluted_api_key_and_oauth():

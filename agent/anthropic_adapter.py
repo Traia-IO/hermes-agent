@@ -529,6 +529,20 @@ def _egress_proxy_callback_token(base_url=None) -> Optional[str]:
     ``ANTHROPIC_API_KEY``. (``ANTHROPIC_API_KEY`` is used only as a last-resort
     fallback, and only when it already *looks* like a callback token.)
 
+    CRITICAL (v8, 2026-07-09 — proven in-pod): in the AGENT-CHILD WORKER process
+    (``hermes gateway run``), ``TRAIA_GATEWAY_CALLBACK_TOKEN`` is SCRUBBED (the
+    workspace token is not handed to children); the child instead carries the
+    PER-AGENT callback token ``TRAIA_AGENT_CALLBACK_TOKEN`` (``<uid>.<agent>.<sig>``),
+    which the proxy validates just the same. Meanwhile the gateway injects the
+    agent's credential-pool cached credential into the child as ``ANTHROPIC_API_KEY``
+    — for a PRE-cutover agent that is a REAL ``sk-ant`` key. So a worker that reads
+    only ``TRAIA_GATEWAY_CALLBACK_TOKEN`` finds nothing, refuses the real-key
+    fallback, returns None → the real key is sent → 401 (alpha-keeper Sonnet). We
+    therefore ALSO accept ``TRAIA_AGENT_CALLBACK_TOKEN``. (openai/xai escaped this
+    only because their ``*_API_KEY`` happened to already be the callback token —
+    the pool hadn't cached a real key for them; this makes the override robust for
+    all providers regardless of what the pool injected.)
+
     The proxy is detected from BOTH the explicit ``base_url`` AND the
     ``ANTHROPIC_BASE_URL`` env the SDK reads on its own (never short-circuit the
     env check on a non-proxy ``base_url``). Returns ``None`` when not proxied,
@@ -537,9 +551,12 @@ def _egress_proxy_callback_token(base_url=None) -> Optional[str]:
     signal = f"{str(base_url or '').strip().lower()} {os.getenv('ANTHROPIC_BASE_URL', '').lower()}"
     if "platform-proxy-llm" not in signal:
         return None
-    callback = os.getenv("TRAIA_GATEWAY_CALLBACK_TOKEN", "").strip()
-    if callback:
-        return callback
+    # Workspace token (set on the gateway container) OR, in the agent-child worker
+    # where it's scrubbed, the per-agent token — the proxy validates both.
+    for var in ("TRAIA_GATEWAY_CALLBACK_TOKEN", "TRAIA_AGENT_CALLBACK_TOKEN"):
+        callback = os.getenv(var, "").strip()
+        if callback:
+            return callback
     # Last-resort fallback: only if ANTHROPIC_API_KEY already holds a
     # callback-shaped token (has a "." and is NOT a real ``sk-ant`` key), never a
     # real provider key.

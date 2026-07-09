@@ -382,6 +382,28 @@ class TestAnthropicOAuthFlag:
             adapter = client.chat.completions
             assert adapter._is_oauth is True
 
+    def test_uses_egress_proxy_base_url_from_env(self, monkeypatch):
+        """On platform pods ANTHROPIC_BASE_URL is the LLM egress proxy — the
+        auxiliary anthropic path must build its client at that proxy base_url
+        (not native api.anthropic.com), so build_anthropic_client()'s proxy
+        override sends the per-agent callback token instead of a real key.
+        Regression guard for the aux-proxy-fold fix (2026-07-09)."""
+        proxy = (
+            "http://llm-egress-proxy.traia-system.svc.cluster.local"
+            "/v1/runtime-callback/workspaces/me/platform-proxy-llm/anthropic"
+        )
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", proxy)
+        with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="uid.agent.sig"), \
+             patch("agent.anthropic_adapter.build_anthropic_client") as mock_build, \
+             patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            mock_build.return_value = MagicMock()
+            from agent.auxiliary_client import _try_anthropic
+            client, model = _try_anthropic()
+            assert client is not None
+            # 2nd positional arg to build_anthropic_client is the base_url; it
+            # must be the proxy, not the native default.
+            assert mock_build.call_args.args[1] == proxy
+
     def test_api_key_no_oauth_flag(self, monkeypatch):
         """Regular API keys (sk-ant-api-*) should create client with is_oauth=False."""
         with patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-api03-testkey1234"), \

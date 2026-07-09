@@ -1679,10 +1679,23 @@ def _try_anthropic(explicit_api_key: str = None) -> Tuple[Optional[Any], Optiona
     if not token:
         return None, None
 
+    # Ride the egress proxy when the runtime is proxied. On platform pods the
+    # sandbox sets ANTHROPIC_BASE_URL to the LLM egress proxy (…/platform-proxy-llm
+    # /anthropic); the MAIN model already routes through it, and the auxiliary
+    # anthropic path must too — otherwise the aux sends requests DIRECT to native
+    # api.anthropic.com and needs a real key on the pod. When base_url is the
+    # proxy, build_anthropic_client() forces the per-workspace/agent callback
+    # token onto x-api-key (its universal proxy override), so no real key is used
+    # or required here. Native (BYOK) runs leave ANTHROPIC_BASE_URL unset → native
+    # default, unchanged.
+    _default_anthropic_base = (
+        os.getenv("ANTHROPIC_BASE_URL", "").strip().rstrip("/")
+        or _ANTHROPIC_DEFAULT_BASE_URL
+    )
     # Allow base URL override from config.yaml model.base_url, but only
     # when the configured provider is anthropic — otherwise a non-Anthropic
     # base_url (e.g. Codex endpoint) would leak into Anthropic requests.
-    base_url = _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL) if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    base_url = _pool_runtime_base_url(entry, _default_anthropic_base) if pool_present else _default_anthropic_base
     try:
         from hermes_cli.config import load_config
         cfg = load_config()

@@ -1752,7 +1752,14 @@ class AIAgent:
         <title> tag instead of dumping raw HTML.  Falls back to a truncated
         str(error) for everything else.
         """
-        raw = str(error)
+        # Defence-in-depth: an API/proxy error's str() (and some SDK bodies) can
+        # embed the outbound request — Authorization header / api_key — or an
+        # upstream body echoing a credential. Scrub the cause here, at the one
+        # point every API-error summary flows through, so a key can't reach a
+        # sink whose formatter doesn't redact (e.g. the GCP stderr stream) or a
+        # non-log surface. force=True: hold even if HERMES_REDACT_SECRETS is off.
+        # (redact_sensitive_text imported at module top.)
+        raw = redact_sensitive_text(str(error), force=True)
 
         if (
             isinstance(error, ValueError)
@@ -1783,7 +1790,9 @@ class AIAgent:
             if msg:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""
-                return AIAgent._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                return AIAgent._decorate_xai_entitlement_error(
+                    redact_sensitive_text(f"{prefix}{msg[:300]}", force=True)
+                )
 
         # Fallback: truncate the raw string but give more room than 200 chars
         status_code = getattr(error, "status_code", None)

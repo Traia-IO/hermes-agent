@@ -1079,3 +1079,33 @@ class TestExternalRotationRecovery:
         assert gw_path.exists(), "gateway.log was never recreated"
         assert "AFTER rotation" in gw_path.read_text()
         assert "AFTER rotation" not in rotated.read_text()
+
+
+def _access_rec(msg: str) -> logging.LogRecord:
+    return logging.LogRecord("aiohttp.access", logging.INFO, __file__, 1, msg, (), None)
+
+
+def test_access_noise_filter_drops_successful_access():
+    """Successful (2xx/3xx) aiohttp access lines — the /health probe + the
+    internal /api/jobs cron poll — are dropped; failures + real activity stay."""
+    f = hermes_logging._AccessNoiseFilter()
+    assert f.filter(_access_rec('1.2.3.4 [x] "GET /health HTTP/1.1" 200 266')) is False
+    assert f.filter(_access_rec('1.2.3.4 [x] "GET /api/jobs/abc HTTP/1.1" 200 1357')) is False
+    assert f.filter(_access_rec('1.2.3.4 [x] "HEAD /v1/health HTTP/1.1" 204 0')) is False
+    # kept: a FAILED request (so real problems surface) + non-access records
+    assert f.filter(_access_rec('1.2.3.4 [x] "GET /health HTTP/1.1" 503 1')) is True
+    assert f.filter(_access_rec('1.2.3.4 [x] "POST /api/chat HTTP/1.1" 404 9')) is True
+    assert f.filter(_access_rec("run.decision decision=BUY tools=2 [ccxt] summary=x")) is True
+
+
+def test_setup_logging_installs_access_noise_filter_once(tmp_path):
+    """setup_logging attaches the access-noise filter to the aiohttp.access
+    LOGGER (api_server's own process) exactly once, idempotent across calls."""
+    access = logging.getLogger("aiohttp.access")
+    access.filters = [
+        fl for fl in access.filters if not isinstance(fl, hermes_logging._AccessNoiseFilter)
+    ]
+    hermes_logging.setup_logging(hermes_home=tmp_path, force=True)
+    assert sum(isinstance(fl, hermes_logging._AccessNoiseFilter) for fl in access.filters) == 1
+    hermes_logging.setup_logging(hermes_home=tmp_path, force=True)
+    assert sum(isinstance(fl, hermes_logging._AccessNoiseFilter) for fl in access.filters) == 1

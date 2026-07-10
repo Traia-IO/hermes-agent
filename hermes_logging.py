@@ -29,6 +29,7 @@ Session context:
 
 import logging
 import os
+import re
 import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -230,6 +231,31 @@ COMPONENT_PREFIXES = {
 }
 
 
+class _AccessNoiseFilter(logging.Filter):
+    """Drop SUCCESSFUL (2xx/3xx) ``aiohttp.access`` request lines.
+
+    The agent's api_server logs every HTTP request via ``aiohttp.access`` at
+    INFO — the ~30s liveness ``/health`` probe and the gateway's per-minute
+    ``GET /api/jobs/<id>`` cron poll dominate ``agent.log`` (observed >80% of
+    lines), burying the run's actual activity (decisions, tool/skill calls).
+    Drop the *successful* ones so the log reads as real work + problems only:
+    a FAILED request (4xx/5xx) still logs, and every non-access record passes
+    untouched. Attached to the ``aiohttp.access`` LOGGER in ``setup_logging``
+    (the api_server's own process), so it applies before any sink.
+    """
+
+    # aiohttp default access line, e.g.
+    #   127.0.0.1 [..] "GET /health HTTP/1.1" 200 266 "-" "python-httpx/.."
+    # Match the status right after the quoted request line; only 2xx/3xx drop.
+    _OK_STATUS = re.compile(r'HTTP/[\d.]+"\s+[23]\d\d\b')
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return self._OK_STATUS.search(record.getMessage()) is None
+        except Exception:  # a log filter must NEVER break logging
+            return True
+
+
 # ---------------------------------------------------------------------------
 # Main setup
 # ---------------------------------------------------------------------------
@@ -364,6 +390,15 @@ def setup_logging(
     # Suppress noisy third-party loggers.
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Drop successful HTTP access-log noise (liveness /health + internal
+    # /api/jobs cron polls) from the agent's api_server so agent.log / errors.log
+    # / the GCP stream carry real activity + failures only. On the
+    # ``aiohttp.access`` LOGGER (not one handler) so 2xx/3xx never reach ANY
+    # sink. Idempotent across repeat setup_logging() calls.
+    access_logger = logging.getLogger("aiohttp.access")
+    if not any(isinstance(f, _AccessNoiseFilter) for f in access_logger.filters):
+        access_logger.addFilter(_AccessNoiseFilter())
 
     _logging_initialized = True
     return log_dir

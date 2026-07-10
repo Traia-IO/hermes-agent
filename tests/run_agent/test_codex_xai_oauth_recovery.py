@@ -231,6 +231,32 @@ def test_summarize_api_error_does_not_accuse_subscribers():
     assert "X Premium+ does NOT include" in summary
 
 
+def test_summarize_api_error_scrubs_credentials():
+    """Defence-in-depth: a credential embedded in the API/proxy error — the
+    outbound request's Authorization header / api_key, or an upstream body that
+    echoes a key — must be masked in the surfaced one-liner, so it can't reach a
+    sink whose formatter doesn't redact (e.g. the GCP stderr stream) or a
+    non-log surface (a stored error, an API response)."""
+    from run_agent import AIAgent
+
+    key = "sk-ant-api03-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4"
+    # 1) key in the raw exception string (SDK exceptions embed the request)
+    summary = AIAgent._summarize_api_error(
+        RuntimeError(f"HTTP 401: Error code: 401 - x-api-key: {key}")
+    )
+    assert key not in summary          # the raw key is gone
+    assert "sk-ant" in summary         # masked stub still recognizable
+    assert "401" in summary            # the useful status survives
+
+    # 2) key in the JSON-body message path (getattr(error, "body", {...}))
+    class _BodyErr(Exception):
+        status_code = 401
+        body = {"error": {"message": f"bad key {key}"}}
+
+    summary2 = AIAgent._summarize_api_error(_BodyErr("x"))
+    assert key not in summary2
+
+
 def test_summarize_api_error_decorates_xai_body_message():
     """SDK-style error with structured body must also get the hint."""
     from run_agent import AIAgent

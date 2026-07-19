@@ -636,3 +636,65 @@ class TestLoadTimeSnapshotSanitization:
         # Block marker appears exactly once, not nested
         assert snapshot.count("[BLOCKED:") == 1
         assert "Clean fact" in snapshot
+
+
+# =========================================================================
+# Actionable errors + loop-breaker + non-destructive archive
+# =========================================================================
+
+class TestActionableErrorsAndArchive:
+    def test_missing_old_text_returns_current_entries(self, store):
+        store.add("memory", "lesson one about slippage")
+        store.add("memory", "lesson two about gas")
+        result = json.loads(memory_tool(action="remove", target="memory", store=store))
+        assert result["success"] is False
+        assert "current_entries" in result
+        assert len(result["current_entries"]) == 2
+        assert "old_text" in result["error"]
+
+    def test_replace_missing_args_actionable(self, store):
+        store.add("memory", "existing note")
+        result = json.loads(memory_tool(action="replace", target="memory", store=store))
+        assert result["success"] is False
+        assert "current_entries" in result
+
+    def test_repeated_identical_failure_escalates(self, store):
+        store.add("memory", "note A")
+        r1 = json.loads(memory_tool(action="remove", target="memory", store=store))
+        json.loads(memory_tool(action="remove", target="memory", store=store))
+        r3 = json.loads(memory_tool(action="remove", target="memory", store=store))
+        assert r1["success"] is False and "STOP" not in r1["error"]
+        assert "STOP" in r3["error"]
+        assert "current_entries" in r3
+
+    def test_success_resets_the_breaker(self, store):
+        json.loads(memory_tool(action="remove", target="memory", store=store))
+        json.loads(memory_tool(action="remove", target="memory", store=store))
+        json.loads(memory_tool(action="add", target="memory", content="ok", store=store))
+        r = json.loads(memory_tool(action="remove", target="memory", store=store))
+        assert "STOP" not in r["error"]
+
+    def test_remove_archives_evicted_entry(self, store, tmp_path):
+        store.add("memory", "a durable lesson worth keeping")
+        store.remove("memory", "durable lesson")
+        archive = tmp_path / "MEMORY.archive.jsonl"
+        assert archive.exists()
+        rec = json.loads(archive.read_text().strip())
+        assert rec["action"] == "remove"
+        assert rec["source"] == "tool"
+        assert rec["schema"] == "mem-archive/1"
+        assert "durable lesson" in rec["text"]
+
+    def test_replace_archives_prior_text(self, store, tmp_path):
+        store.add("memory", "old wording of the rule")
+        store.replace("memory", "old wording", "new wording of the rule")
+        rec = json.loads((tmp_path / "MEMORY.archive.jsonl").read_text().strip())
+        assert rec["action"] == "replace"
+        assert "old wording" in rec["text"]
+        assert "new wording" in rec["replaced_with"]
+
+    def test_user_target_uses_separate_archive(self, store, tmp_path):
+        store.add("user", "user likes terse replies")
+        store.remove("user", "terse replies")
+        assert (tmp_path / "USER.archive.jsonl").exists()
+        assert not (tmp_path / "MEMORY.archive.jsonl").exists()

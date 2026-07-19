@@ -75,6 +75,7 @@ ENTRY_DELIMITER = "\n§\n"
 
 MEMORY_ARCHIVE_NAME = "MEMORY.archive.jsonl"
 USER_ARCHIVE_NAME = "USER.archive.jsonl"
+OWNER_ARCHIVE_NAME = "OWNER.archive.jsonl"
 # Schema tag so a later CBR vectorizer can ingest the archive by contract. Each
 # JSONL line is a self-contained record whose ``text`` field is the embeddable
 # content and the rest is retrieval metadata (bump on any shape change). Keep in
@@ -88,7 +89,10 @@ ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
 
 
 def _archive_path(target: str) -> Path:
-    name = USER_ARCHIVE_NAME if target == "user" else MEMORY_ARCHIVE_NAME
+    name = {
+        "user": USER_ARCHIVE_NAME,
+        "owner": OWNER_ARCHIVE_NAME,
+    }.get(target, MEMORY_ARCHIVE_NAME)
     return get_memory_dir() / name
 
 
@@ -199,13 +203,23 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        owner_char_limit: int = 1500,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        # OWNER.md: the owner's standing DIRECTIVES (trading mandates confirmed in
+        # chat) — a separate, highest-authority store, never auto-pruned. Distinct
+        # from USER.md (who the user IS) and MEMORY.md (what the agent LEARNED).
+        self.owner_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.owner_char_limit = owner_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "owner": ""}
         # Loop-breaker: track consecutive identical FAILING calls within a
         # session so we can escalate instead of letting the model spin on the
         # same malformed call (observed: 8× remove-without-old_text in one run).
@@ -235,21 +249,25 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.owner_entries = self._read_file(mem_dir / "OWNER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.owner_entries = list(dict.fromkeys(self.owner_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
+        # (memory_entries / user_entries / owner_entries) keeps the raw text so
+        # the user can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_owner = self._sanitize_entries_for_snapshot(self.owner_entries, "OWNER.md")
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
+            "owner": self._render_block("owner", sanitized_owner),
         }
 
     @staticmethod
@@ -330,6 +348,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
+        if target == "owner":
+            return mem_dir / "OWNER.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str) -> Optional[str]:
@@ -358,11 +378,15 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
+        if target == "owner":
+            return self.owner_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
+        elif target == "owner":
+            self.owner_entries = entries
         else:
             self.memory_entries = entries
 
@@ -375,6 +399,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "owner":
+            return self.owner_char_limit
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -637,6 +663,11 @@ class MemoryStore:
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "owner":
+            header = (
+                f"OWNER DIRECTIVES (standing rules your owner set — you MUST follow these) "
+                f"[{pct}% — {current:,}/{limit:,} chars]"
+            )
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -767,8 +798,10 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "user", "owner"}:
+        return tool_error(
+            f"Invalid target '{target}'. Use 'memory', 'user', or 'owner'.", success=False
+        )
 
     if action == "add":
         result = store.add(target, content) if content else store.missing_arg_error(target, "add")
@@ -820,7 +853,10 @@ MEMORY_SCHEMA = {
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
+        "THREE TARGETS:\n"
+        "- 'owner': STANDING DIRECTIVES your owner set for how you trade -- 'only trade "
+        "majors', 'never hold overnight'. Highest authority; you MUST follow them. Save "
+        "here ONLY what the owner confirmed in chat (see the Owner-messages guidance).\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
@@ -837,8 +873,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "user", "owner"],
+                "description": "Which memory store: 'memory' for your learned notes, 'user' for user profile, 'owner' for the owner's confirmed standing directives."
             },
             "content": {
                 "type": "string",

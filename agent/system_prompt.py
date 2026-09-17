@@ -301,6 +301,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     volatile_parts: List[str] = []
 
     if agent._memory_store:
+        # OWNER.md first — highest authority (standing directives the owner set;
+        # the agent MUST follow them), so it leads the volatile tier.
+        if getattr(agent, "_owner_directives_enabled", False):
+            owner_block = agent._memory_store.format_for_system_prompt("owner")
+            if owner_block:
+                volatile_parts.append(owner_block)
         if agent._memory_enabled:
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:

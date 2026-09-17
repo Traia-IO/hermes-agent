@@ -29,6 +29,7 @@ import os
 import tempfile
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -57,6 +58,87 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+# ---------------------------------------------------------------------------
+# Non-destructive eviction archive.
+#
+# ``remove`` / ``replace`` used to DELETE learning outright — a single trim
+# (e.g. 1,686 → 310 chars) permanently destroyed everything evicted, with no
+# record. That is unacceptable for a learning system and leaves us no data to
+# analyse how curation behaves. Instead of deleting, every eviction is APPENDED
+# to a per-agent append-only JSONL archive: MEMORY.md is the small "hot working
+# set", the archive is the durable corpus (the future retrieval / CBR memory
+# reads from here). Best-effort — an archive failure must never block or fail
+# the underlying memory mutation.
+# ---------------------------------------------------------------------------
+
+MEMORY_ARCHIVE_NAME = "MEMORY.archive.jsonl"
+USER_ARCHIVE_NAME = "USER.archive.jsonl"
+OWNER_ARCHIVE_NAME = "OWNER.archive.jsonl"
+# Schema tag so a later CBR vectorizer can ingest the archive by contract. Each
+# JSONL line is a self-contained record whose ``text`` field is the embeddable
+# content and the rest is retrieval metadata (bump on any shape change). Keep in
+# sync with the plugin's memory_curation._archive_dropped.
+ARCHIVE_SCHEMA = "mem-archive/1"
+# PVC safety valve ONLY. The durable design ejects this corpus to external CBR
+# storage — until then, cap the on-PVC file so a runaway agent can't fill the
+# workspace PVC (cf. the gateway-log PVC incident). One rotation is kept, so
+# worst-case on-disk = 2×. Entries are ~hundreds of bytes → ~100k+ before rotate.
+ARCHIVE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _archive_path(target: str) -> Path:
+    name = {
+        "user": USER_ARCHIVE_NAME,
+        "owner": OWNER_ARCHIVE_NAME,
+    }.get(target, MEMORY_ARCHIVE_NAME)
+    return get_memory_dir() / name
+
+
+def _rotate_archive_if_large(path: Path) -> None:
+    """Rotate the archive to ``<name>.1`` (keeping one backup) once it exceeds
+    ARCHIVE_MAX_BYTES, so it can never fill the PVC. Best-effort."""
+    try:
+        if path.exists() and path.stat().st_size >= ARCHIVE_MAX_BYTES:
+            os.replace(path, path.with_suffix(path.suffix + ".1"))
+    except OSError:
+        pass
+
+
+def archive_evicted(
+    target: str,
+    action: str,
+    evicted: str,
+    *,
+    replaced_with: Optional[str] = None,
+    reason: Optional[str] = None,
+    source: str = "tool",
+) -> None:
+    """Append an evicted entry to the append-only archive so trimming is
+    NON-DESTRUCTIVE and analysable. ``source`` distinguishes the agent's own
+    ``memory`` tool from the automated curation pass. The record is
+    embedding-ready (``text`` = the content to vectorize). Never raises."""
+    if not evicted:
+        return
+    try:
+        path = _archive_path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_archive_if_large(path)
+        rec = {
+            "schema": ARCHIVE_SCHEMA,
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "target": target,
+            "source": source,  # tool | curation
+            "action": action,  # remove | replace | dedup | compact
+            "reason": reason,
+            "text": evicted,  # the embeddable content
+            "replaced_with": replaced_with,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 — best-effort, must never break a mutation
+        logger.debug("memory archive append failed (target=%s)", target, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -121,13 +203,28 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(
+        self,
+        memory_char_limit: int = 2200,
+        user_char_limit: int = 1375,
+        owner_char_limit: int = 1500,
+    ):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
+        # OWNER.md: the owner's standing DIRECTIVES (trading mandates confirmed in
+        # chat) — a separate, highest-authority store, never auto-pruned. Distinct
+        # from USER.md (who the user IS) and MEMORY.md (what the agent LEARNED).
+        self.owner_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.owner_char_limit = owner_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": "", "owner": ""}
+        # Loop-breaker: track consecutive identical FAILING calls within a
+        # session so we can escalate instead of letting the model spin on the
+        # same malformed call (observed: 8× remove-without-old_text in one run).
+        self._last_fail_sig: Optional[str] = None
+        self._repeat_fail_count: int = 0
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
@@ -152,21 +249,25 @@ class MemoryStore:
 
         self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
         self.user_entries = self._read_file(mem_dir / "USER.md")
+        self.owner_entries = self._read_file(mem_dir / "OWNER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        self.owner_entries = list(dict.fromkeys(self.owner_entries))
 
         # Sanitize entries for the system-prompt snapshot only.  Live state
-        # (memory_entries / user_entries) keeps the raw text so the user
-        # can see + remove poisoned entries via the memory tool.
+        # (memory_entries / user_entries / owner_entries) keeps the raw text so
+        # the user can see + remove poisoned entries via the memory tool.
         sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
         sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
+        sanitized_owner = self._sanitize_entries_for_snapshot(self.owner_entries, "OWNER.md")
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
             "memory": self._render_block("memory", sanitized_memory),
             "user": self._render_block("user", sanitized_user),
+            "owner": self._render_block("owner", sanitized_owner),
         }
 
     @staticmethod
@@ -247,6 +348,8 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         if target == "user":
             return mem_dir / "USER.md"
+        if target == "owner":
+            return mem_dir / "OWNER.md"
         return mem_dir / "MEMORY.md"
 
     def _reload_target(self, target: str) -> Optional[str]:
@@ -275,11 +378,15 @@ class MemoryStore:
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
             return self.user_entries
+        if target == "owner":
+            return self.owner_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
         if target == "user":
             self.user_entries = entries
+        elif target == "owner":
+            self.owner_entries = entries
         else:
             self.memory_entries = entries
 
@@ -292,6 +399,8 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         if target == "user":
             return self.user_char_limit
+        if target == "owner":
+            return self.owner_char_limit
         return self.memory_char_limit
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
@@ -398,11 +507,16 @@ class MemoryStore:
                     ),
                 }
 
+            old_entry = entries[idx]
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            # Archive the superseded text so the prior wording isn't lost.
+            archive_evicted(
+                target, "replace", old_entry, replaced_with=new_content, source="tool"
+            )
 
-        return self._success_response(target, "Entry replaced.")
+        return self._success_response(target, "Entry replaced (prior text archived).")
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -434,11 +548,14 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            evicted = entries[idx]
             entries.pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
+            # Non-destructive: keep the evicted entry in the durable archive.
+            archive_evicted(target, "remove", evicted, source="tool")
 
-        return self._success_response(target, "Entry removed.")
+        return self._success_response(target, "Entry removed (archived).")
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -452,6 +569,68 @@ class MemoryStore:
         """
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
+
+    def _fresh_entries(self, target: str) -> List[str]:
+        """Read entries from disk without mutating in-memory state (for building
+        actionable error responses)."""
+        return list(dict.fromkeys(self._read_file(self._path_for(target))))
+
+    def missing_arg_error(self, target: str, action: str) -> Dict[str, Any]:
+        """Actionable error for a call missing its required argument. Unlike a
+        bare 'X is required' string, this returns the CURRENT entries + usage +
+        a concrete hint, so the model supplies a valid argument on the NEXT turn
+        instead of blindly retrying the same malformed call (the observed
+        remove-without-old_text spin loop)."""
+        entries = self._fresh_entries(target)
+        current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+        limit = self._char_limit(target)
+        hints = {
+            "add": "Provide `content`: the text of the new entry to save.",
+            "replace": (
+                "Provide BOTH `old_text` (a short unique substring identifying the "
+                "entry to change) and `content` (the new text)."
+            ),
+            "remove": (
+                "Provide `old_text`: a short unique substring of the entry to delete. "
+                "Pick it from `current_entries` below."
+            ),
+        }
+        return {
+            "success": False,
+            "error": f"`{action}` is missing a required argument. {hints.get(action, '')}",
+            "target": target,
+            "current_entries": entries,
+            "usage": f"{current:,}/{limit:,} chars",
+            "entry_count": len(entries),
+        }
+
+    def note_result(self, sig: str, success: bool) -> int:
+        """Track consecutive identical FAILURES for the loop-breaker. Returns the
+        current consecutive-failure count for ``sig`` (0 on success)."""
+        if success:
+            self._last_fail_sig = None
+            self._repeat_fail_count = 0
+            return 0
+        if sig == self._last_fail_sig:
+            self._repeat_fail_count += 1
+        else:
+            self._last_fail_sig = sig
+            self._repeat_fail_count = 1
+        return self._repeat_fail_count
+
+    def escalate_repeated_failure(
+        self, target: str, result: Dict[str, Any], repeats: int
+    ) -> Dict[str, Any]:
+        """Rewrite a repeatedly-failing result into a loud STOP directive with the
+        current entries, so the model breaks out of an identical-call loop."""
+        out = dict(result)
+        out["error"] = (
+            f"STOP — you have made this same `memory` call {repeats} times and it keeps "
+            f"failing: {result.get('error', '')} Do NOT repeat it. Either pick an exact "
+            f"`old_text` substring from `current_entries`, or move on without editing memory."
+        )
+        out.setdefault("current_entries", self._fresh_entries(target))
+        return out
 
     # -- Internal helpers --
 
@@ -484,6 +663,11 @@ class MemoryStore:
 
         if target == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif target == "owner":
+            header = (
+                f"OWNER DIRECTIVES (standing rules your owner set — you MUST follow these) "
+                f"[{pct}% — {current:,}/{limit:,} chars]"
+            )
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -614,28 +798,30 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in {"memory", "user"}:
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    if target not in {"memory", "user", "owner"}:
+        return tool_error(
+            f"Invalid target '{target}'. Use 'memory', 'user', or 'owner'.", success=False
+        )
 
     if action == "add":
-        if not content:
-            return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
-
+        result = store.add(target, content) if content else store.missing_arg_error(target, "add")
     elif action == "replace":
-        if not old_text:
-            return tool_error("old_text is required for 'replace' action.", success=False)
-        if not content:
-            return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
-
+        result = (
+            store.replace(target, old_text, content)
+            if (old_text and content)
+            else store.missing_arg_error(target, "replace")
+        )
     elif action == "remove":
-        if not old_text:
-            return tool_error("old_text is required for 'remove' action.", success=False)
-        result = store.remove(target, old_text)
-
+        result = store.remove(target, old_text) if old_text else store.missing_arg_error(target, "remove")
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
+
+    # Loop-breaker: escalate an identical call that keeps failing so the model
+    # stops repeating a malformed request (missing arg, no-match, etc.).
+    sig = f"{action}|{target}|{old_text}|{(content or '')[:40]}"
+    repeats = store.note_result(sig, bool(result.get("success")))
+    if not result.get("success") and repeats >= 3:
+        result = store.escalate_repeated_failure(target, result, repeats)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -667,7 +853,10 @@ MEMORY_SCHEMA = {
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
-        "TWO TARGETS:\n"
+        "THREE TARGETS:\n"
+        "- 'owner': STANDING DIRECTIVES your owner set for how you trade -- 'only trade "
+        "majors', 'never hold overnight'. Highest authority; you MUST follow them. Save "
+        "here ONLY what the owner confirmed in chat (see the Owner-messages guidance).\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
         "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
@@ -684,8 +873,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "user", "owner"],
+                "description": "Which memory store: 'memory' for your learned notes, 'user' for user profile, 'owner' for the owner's confirmed standing directives."
             },
             "content": {
                 "type": "string",

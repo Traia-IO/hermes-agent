@@ -1,5 +1,6 @@
 import sys
 import types
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -105,6 +106,29 @@ def _codex_tool_call_response():
         usage=SimpleNamespace(input_tokens=12, output_tokens=4, total_tokens=16),
         status="completed",
         model="gpt-5-codex",
+    )
+
+
+def _codex_truncated_message_response(text: str):
+    """A turn cut off by ``max_output_tokens``.
+
+    This is the exact shape the Responses API returns when a REASONING model
+    (grok-4.3) spends its output budget thinking: terminal event is
+    ``response.incomplete``, the message item is still ``incomplete``, and there
+    IS partial visible text. Captured from the live xAI API.
+    """
+    return SimpleNamespace(
+        output=[
+            SimpleNamespace(
+                type="message",
+                status="incomplete",
+                content=[SimpleNamespace(type="output_text", text=text)],
+            )
+        ],
+        usage=SimpleNamespace(input_tokens=4, output_tokens=2, total_tokens=6),
+        status="incomplete",
+        incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        model="grok-4.3",
     )
 
 
@@ -2280,3 +2304,75 @@ def test_run_conversation_codex_invalid_encrypted_content_without_replay_state_d
     assert all(not any(item.get("type") == "reasoning" for item in payload["input"]) for payload in request_payloads)
     assert agent._codex_reasoning_replay_enabled is True
     assert result["messages"][0].get("codex_reasoning_items") is None
+
+
+def test_codex_incomplete_turn_is_asked_for_the_answer(monkeypatch):
+    """An adapter-classified `incomplete` turn must be told to produce the answer.
+
+    Without this the retry is byte-identical to the request that just came back
+    with no visible text, so the model repeats itself, three times, and the whole
+    run is discarded. Measured on the live prod fleet before this fix: 192 of 192
+    failed runs were error_class="incomplete" (two agents at 20/20), while every
+    anthropic and gpt-5.5 agent — which take the chat_completions/anthropic path
+    that has always appended a continuation prompt — sat at zero failures.
+    """
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_message_response("thinking about it"),
+        _codex_message_response("DECISION: HOLD"),
+    ]
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: responses.pop(0))
+
+    result = agent.run_conversation("analyse the market")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "DECISION: HOLD"
+    nudges = [
+        m for m in result["messages"]
+        if m.get("role") == "user" and "no visible answer" in (m.get("content") or "")
+    ]
+    assert len(nudges) == 1, "an incomplete codex turn must get exactly one continuation prompt"
+    # It must NOT claim truncation: a turn with no visible text has no point to
+    # resume from, and saying so invites the model to invent one.
+    assert not any(
+        "truncated by the output length limit" in (m.get("content") or "")
+        for m in result["messages"]
+    )
+
+
+def test_codex_continuation_prompt_reaches_the_provider(monkeypatch):
+    """The prompt has to be on the WIRE, not just in the local transcript —
+    appending it to `messages` only helps if the next request carries it."""
+    agent = _build_agent(monkeypatch)
+    requests = []
+    responses = [
+        _codex_incomplete_message_response("thinking about it"),
+        _codex_message_response("DECISION: HOLD"),
+    ]
+
+    def _capture(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _capture)
+    agent.run_conversation("analyse the market")
+
+    assert len(requests) >= 2
+    replay = json.dumps(requests[1].get("input"))
+    assert "no visible answer" in replay
+
+
+def test_codex_incomplete_still_fails_after_three_attempts(monkeypatch):
+    """The nudge must not turn a genuinely stuck model into an infinite loop —
+    the 3-attempt budget still ends the turn."""
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: _codex_incomplete_message_response("still thinking"),
+    )
+
+    result = agent.run_conversation("analyse the market")
+
+    assert result["completed"] is False
+    assert "remained incomplete" in (result.get("error") or "")

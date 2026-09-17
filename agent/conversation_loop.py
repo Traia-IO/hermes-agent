@@ -3766,6 +3766,40 @@ def run_conversation(
                         agent._emit_interim_assistant_message(interim_msg)
 
                 if agent._codex_incomplete_retries < 3:
+                    # Tell the model HOW to finish before re-requesting.
+                    #
+                    # Without this the continuation is byte-identical to the
+                    # request that just came back empty, so the model repeats
+                    # whatever it did — three times — and the entire run is
+                    # discarded. This is THE dominant prod failure on reasoning
+                    # models: measured on the live fleet, 192 of 192 failed runs
+                    # were error_class="incomplete", two agents at 20/20, while
+                    # every anthropic and gpt-5.5 agent sat at 0 failures.
+                    #
+                    # The equivalent chat_completions/anthropic path has always
+                    # appended a continuation prompt (the `finish_reason ==
+                    # "length"` handler above), but that block is guarded to
+                    # exclude codex_responses — so this branch, the one reasoning
+                    # models actually land in, never got one.
+                    #
+                    # Deliberately NOT the truncation prompt ("continue where you
+                    # left off"): a turn that produced no visible text has no
+                    # "where" to resume from, and telling it to resume mid-answer
+                    # invites it to invent one. The max_output_tokens shape never
+                    # reaches here anyway — the loop maps that to "length" well
+                    # before this point.
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[System: Your previous turn produced internal "
+                                "reasoning but no visible answer. Do not repeat or "
+                                "restate that analysis. Write your final answer "
+                                "now, including any decision line your "
+                                "instructions require.]"
+                            ),
+                        }
+                    )
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
                     agent._session_messages = messages
